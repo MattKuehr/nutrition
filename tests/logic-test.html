@@ -1,0 +1,137 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Logic tests</title></head>
+<body>
+<pre id="out">Running…</pre>
+<script type="module">
+// Tests for the calculations, the step paste, and the CSV files.
+// Open this page in a browser through a local web server. The page shows PASS or FAIL for each test.
+import * as L from '../logic.js';
+
+const results = [];
+function check(name, ok, detail = '') { results.push(`${ok ? 'PASS' : 'FAIL'}  ${name}${ok ? '' : `  -> ${detail}`}`); }
+const near = (a, b, tol = 0.5) => Math.abs(a - b) <= tol;
+// JSON text with sorted keys, so that the order of the fields does not matter.
+const canon = (x) => JSON.stringify(x, (k, v) => (v && typeof v === 'object' && !Array.isArray(v) ? Object.fromEntries(Object.keys(v).sort().map((key) => [key, v[key]])) : v));
+
+function sample() {
+  const s = L.defaultSettings();
+  Object.assign(s, { heightFt: 5, heightIn: 10, age: 23, sex: 'male' });
+  return { settings: s, foods: [], entries: [], days: {} };
+}
+const entry = (date, kcal, protein, mult = 1, extra = {}) =>
+  ({ id: `${date}-${kcal}-${protein}-${mult}`, date, foodId: null, name: 'x', serving: 'one-time', kcal, protein, carbs: 0, fat: 0, mult, createdAt: 1, ...extra });
+
+try {
+  // 1. Energy: the numbers from the Gemini method.
+  {
+    const d = sample();
+    d.days['2026-11-09'] = { date: '2026-11-09', weight: 145, steps: 11000 };
+    const en = L.energy(d, '2026-11-09');
+    check('Base burn for 145 lb, 5 ft 10 in, age 23, male is about 1,659', near(en.bmr, 1659), en.bmr);
+    check('Step burn for 11,000 steps at 145 lb is about 423', near(en.stepBurn, 422.675, 0.01), en.stepBurn);
+    check('Total burn is about 2,382 (1,659 + 300 + 423)', near(en.burn, 2381.6, 1), en.burn);
+    check('No food eaten: the net equals the burn (a deficit)', near(en.net, en.burn, 0.001), en.net);
+    const none = L.energy(L.defaultSettings && { ...sample(), settings: L.defaultSettings() }, '2026-11-09');
+    check('Missing height, age, and weight are reported', none.missing?.join() === 'height,age,weight', JSON.stringify(none));
+  }
+
+  // 2. Goal status.
+  {
+    const floor = { type: 'floor', value: 140 }, ceil = { type: 'ceiling', value: 2100 };
+    check('Floor: below is not met', L.status(139, floor) === 'not');
+    check('Floor: exact is met', L.status(140, floor) === 'met');
+    check('Floor: above is exceeded (good)', L.status(141, floor) === 'exceeded-good');
+    check('Ceiling: exact is met', L.status(2100, ceil) === 'met');
+    check('Ceiling: above is exceeded (bad)', L.status(2101, ceil) === 'exceeded-bad');
+    check('No goal gives no status', L.status(50, { type: 'none', value: null }) === null);
+  }
+
+  // 3. Weight used in the formulas.
+  {
+    const d = sample();
+    d.days['2026-11-01'] = { date: '2026-11-01', weight: 150 };
+    d.days['2026-11-05'] = { date: '2026-11-05', weight: 144 };
+    d.days['2026-11-08'] = { date: '2026-11-08', weight: 146 };
+    const w = L.weightUsed(d, '2026-11-09');
+    check('Average of the weights in the last 7 days (Nov 1 is outside)', w.kind === 'average' && w.count === 2 && near(w.lb, 145, 1e-9), JSON.stringify(w));
+    const old = L.weightUsed(d, '2026-11-20');
+    check('No weight in 7 days: the most recent weight', old.kind === 'recent' && old.lb === 146, JSON.stringify(old));
+  }
+
+  // 4. Steps from the clipboard.
+  {
+    const today = '2026-11-09';
+    const two = L.parseStepsClipboard('2026-11-08 12034\n2026-11-09 3,021', today);
+    check('Two lines: yesterday and today', JSON.stringify(two) === JSON.stringify([{ date: '2026-11-08', steps: 12034 }, { date: '2026-11-09', steps: 3021 }]), JSON.stringify(two));
+    const old = L.parseStepsClipboard('2026-11-07 5000\n2026-11-08 9000.0\n2026-11-09 100', today);
+    check('A line for an older day is ignored', old.length === 2 && old[0].steps === 9000, JSON.stringify(old));
+    check('Only a number: the total for today', JSON.stringify(L.parseStepsClipboard('8,432', today)) === JSON.stringify([{ date: today, steps: 8432 }]));
+    check('No number: nothing', L.parseStepsClipboard('hello', today).length === 0);
+  }
+
+  // 5. Calendar result and streaks.
+  {
+    const d = sample();
+    const good = (date, protein = 150) => { d.entries.push(entry(date, 2000, protein)); d.days[date] = { date, steps: 12000 }; };
+    good('2026-11-01'); good('2026-11-02');            // streak of 2
+    d.entries.push(entry('2026-11-03', 2500, 150));     // calories over: red
+    d.days['2026-11-03'] = { date: '2026-11-03', steps: 12000 };
+    good('2026-11-04'); good('2026-11-05'); good('2026-11-06');
+    // Nov 7: no data, breaks the streak.
+    good('2026-11-08');
+    good('2026-11-09');                                // today: does not count yet
+    check('A day over the calorie ceiling is red', L.dayResult(d, '2026-11-03') === 'red');
+    check('All met and a floor exceeded is dark green', L.dayResult(d, '2026-11-01') === 'dark');
+    check('A day with no data is "none"', L.dayResult(d, '2026-11-07') === 'none');
+    const exact = sample();
+    exact.entries.push(entry('2026-11-01', 2000, 140));
+    exact.days['2026-11-01'] = { date: '2026-11-01', steps: 11000 };
+    check('All goals exactly met is light green', L.dayResult(exact, '2026-11-01') === 'light');
+    const s = L.streaks(d, '2026-11-09');
+    check('Current streak is 1 (Nov 8; today does not count)', s.current === 1, JSON.stringify(s));
+    check('Longest streak is 3 (Nov 4 to Nov 6)', s.longest === 3, JSON.stringify(s));
+  }
+
+  // 6. Full CSV: export, then import, gives the same data.
+  {
+    const d = sample();
+    d.settings.goals.carbs = { type: 'ceiling', value: 250 };
+    d.foods.push({ id: 'f1', name: 'Chicken, "grilled"', serving: '100 g', kcal: 165, protein: 31, carbs: 0, fat: 3.6 });
+    d.entries.push(entry('2026-11-08', 165, 31, 1.6, { id: 'e1', foodId: 'f1', name: 'Chicken, "grilled"', serving: '100 g', fat: 3.6 }));
+    d.entries.push(entry('2026-11-08', 45, 2, 1, { id: 'e2', name: 'Coffee\nwith milk', createdAt: 2 }));
+    d.days['2026-11-08'] = { date: '2026-11-08', steps: 12034, weight: 143.8 };
+    d.days['2026-11-09'] = { date: '2026-11-09', weight: 143.6 };
+    const csv = L.fullCsv(d);
+    const back = L.parseFullCsv(csv);
+    check('Settings come back the same', canon(back.settings) === canon(d.settings), JSON.stringify(back.settings));
+    check('Saved foods come back the same', canon(back.foods) === canon(d.foods), JSON.stringify(back.foods));
+    const strip = (es) => es.map(({ createdAt, ...rest }) => rest);
+    check('Food entries come back the same', canon(strip(back.entries)) === canon(strip(d.entries)), JSON.stringify(back.entries));
+    check('Steps and weights come back the same', canon(back.days) === canon(d.days), JSON.stringify(back.days));
+    check('Entry rows have the totals (1.6 × 165 = 264)', csv.includes(',264,'), csv);
+    let msg = '';
+    try { L.parseFullCsv('date,calories\n2026-11-08,100\n'); } catch (e) { msg = e.message; }
+    check('A compact file is refused on import', msg.includes('not a full CSV'), msg);
+  }
+
+  // 7. Compact CSV.
+  {
+    const d = sample();
+    d.entries.push(entry('2026-11-07', 2000, 150));
+    d.days['2026-11-07'] = { date: '2026-11-07', steps: 12000, weight: 145 };
+    const rows = L.parseCsv(L.compactCsv(d, '2026-11-09'));
+    check('Compact file: a header and one row for each day (Nov 7, 8, 9)', rows.length === 4, rows.length);
+    check('Compact file: Nov 7 is all met with a floor exceeded', rows[1].at(-1) === 'all_met_floor_exceeded', rows[1].join());
+    check('Compact file: Nov 8 has no data', rows[2].at(-1) === 'no_data', rows[2].join());
+    check('Compact file: today is in progress', rows[3].at(-1) === 'in_progress', rows[3].join());
+  }
+} catch (err) {
+  results.push(`FAIL  The tests stopped with an error: ${err.stack || err}`);
+}
+
+const fails = results.filter((r) => r.startsWith('FAIL')).length;
+document.getElementById('out').textContent = `${results.join('\n')}\n\n${fails ? `${fails} FAILED` : `ALL ${results.length} PASSED`}`;
+</script>
+</body>
+</html>
